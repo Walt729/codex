@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+**/runner.lock
+**/stop.request
+**/git-sync.jsonl
+**/git-sync.log
+**/git-sync-state.json
+.codex/
+.aws/
+.env
+.env.*
