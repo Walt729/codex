@@ -21,6 +21,10 @@ class CheckpointError(Exception):
     pass
 
 
+class CheckpointCancelled(CheckpointError):
+    pass
+
+
 def remote_identity(value):
     """Return host/owner/repository without printing or returning credential values."""
     if "://" in value:
@@ -67,13 +71,16 @@ def _walk_error(_error):
 
 
 class _Git:
-    def __init__(self, cwd, deadline):
+    def __init__(self, cwd, deadline, cancelled=None):
         self.cwd = cwd
         self.deadline = deadline
+        self.cancelled = cancelled
         self.env = os.environ.copy()
         self.env["GIT_TERMINAL_PROMPT"] = "0"
 
     def run(self, *args, data=None, ok=(0,)):
+        if self.cancelled and self.cancelled():
+            raise CheckpointCancelled("Git checkpoint cancelled; local artifacts retained.")
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise CheckpointError("Git checkpoint exceeded its total time budget.")
@@ -81,15 +88,27 @@ class _Git:
                                 stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env,
                                 start_new_session=True)
+        first = True
         try:
-            out, err = proc.communicate(input=data, timeout=remaining)
-        except subprocess.TimeoutExpired:
+            while True:
+                if self.cancelled and self.cancelled():
+                    raise CheckpointCancelled("Git checkpoint cancelled; local artifacts retained.")
+                remaining = self.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CheckpointError("Git checkpoint exceeded its total time budget.")
+                try:
+                    out, err = proc.communicate(input=data if first else None,
+                                               timeout=min(0.1, remaining) if self.cancelled else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+        except CheckpointError:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
             proc.communicate()
-            raise CheckpointError("Git checkpoint exceeded its total time budget.") from None
+            raise
         if proc.returncode not in ok:
             text = err.decode(errors="replace").casefold()
             if args and args[0] == "push":
@@ -105,14 +124,15 @@ class _Git:
         return out, proc.returncode
 
 
-def sync_task(task_root, expected_remote=DEFAULT_REMOTE, timeout=60):
+def sync_task(task_root, expected_remote=DEFAULT_REMOTE, timeout=60, cancelled=None):
     """Commit this task's artifacts and normally push the current branch; never force/reset.
 
     Any pre-staged work blocks synchronization unchanged. A failed push retains the local
     commit, and a subsequent call always retries push even if the task files did not change.
     Returned errors deliberately omit raw Git stderr and credential-bearing remote URLs.
     """
-    result = {"status": "blocked", "commit": None, "pushed": False, "error": None}
+    result = {"status": "blocked", "commit": None, "pushed": False, "error": None,
+              "cancelled": False}
     selected = []
     staged_here = False
     git = None
@@ -126,7 +146,7 @@ def sync_task(task_root, expected_remote=DEFAULT_REMOTE, timeout=60):
         task = task.resolve(strict=True)
         if not task.is_dir():
             raise CheckpointError("Task path is not a directory.")
-        git = _Git(task, time.monotonic() + timeout)
+        git = _Git(task, time.monotonic() + timeout, cancelled)
         raw, _ = git.run("rev-parse", "--show-toplevel")
         root = Path(os.fsdecode(raw.rstrip(b"\n"))).resolve()
         if not task.is_relative_to(root) or task == root:
@@ -204,10 +224,14 @@ def sync_task(task_root, expected_remote=DEFAULT_REMOTE, timeout=60):
         git.run("push", _push_target(remote, identity), "HEAD:refs/heads/" + branch)
         result.update(status="synced", pushed=True)
     except (CheckpointError, OSError, ValueError) as exc:
+        result["cancelled"] = isinstance(exc, CheckpointCancelled)
         result["error"] = str(exc) if isinstance(exc, CheckpointError) else "Git checkpoint could not safely access its task or repository."
         if staged_here and git and selected:
             # Undo only staging performed by this call; never reset or modify files.
             try:
+                # Local staging cleanup is bounded by the original deadline; it must
+                # not be cancelled again before undoing only this call's staging.
+                git.cancelled = None
                 data = b"\0".join(os.fsencode(p) for p in selected) + b"\0"
                 _, code = git.run("rev-parse", "--verify", "HEAD", ok=(0, 128))
                 if code:

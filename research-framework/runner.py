@@ -207,21 +207,106 @@ is insufficient: your report becomes a review and substantive research will resu
 """
 
 
-def kill_group(proc):
-    if proc.poll() is not None:
-        return
+def group_identity(pid):
+    """Read only the Linux process birth time, state, process group and session."""
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return {"start": fields[19], "state": fields[0],
+                "group": int(fields[2]), "session": int(fields[3])}
+    except FileNotFoundError:
+        return None
+
+
+def register_owned_group(proc):
+    identity = group_identity(proc.pid)
+    proc._research_group = None
+    if identity and identity["group"] == proc.pid and identity["session"] == proc.pid:
+        proc._research_group = {"leader_start": identity["start"],
+                                "members": {proc.pid: identity["start"]}}
+
+
+def owned_group_members(proc):
+    """Scan a group only while its original leader or a known member anchors it."""
+    owned = getattr(proc, "_research_group", None)
+    if not owned:
+        return None
+    leader = group_identity(proc.pid)
+    if leader and leader["start"] != owned["leader_start"]:
+        return None  # PID was reused; never signal its new group.
+    anchored = False
+    for pid, start in owned["members"].items():
+        current = group_identity(pid)
+        if (current and current["start"] == start and current["group"] == proc.pid
+                and current["session"] == proc.pid):
+            anchored = True
+            break
+    if not anchored:
+        try:
+            os.killpg(proc.pid, 0)
+        except ProcessLookupError:
+            return []
+        return None  # An unidentifiable group remains: fail closed.
+    members = []
+    for path in Path("/proc").iterdir():
+        if not path.name.isdecimal():
+            continue
+        identity = group_identity(int(path.name))
+        if (identity and identity["group"] == proc.pid and identity["session"] == proc.pid
+                and int(identity["start"]) >= int(owned["leader_start"])):
+            owned["members"][int(path.name)] = identity["start"]
+            if identity["state"] not in ("Z", "X"):
+                members.append(int(path.name))
+    return members
+
+
+def owned_group_finished(proc):
+    # WNOWAIT leaves a finished leader identifiable while descendant identities are
+    # captured. Calling poll() first would reap that leader and lose the ownership anchor.
+    if proc.returncode is not None:
+        return True
+    finished = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if finished is None:
+        return False
+    owned_group_members(proc)
+    proc.poll()
+    return True
+
+
+def kill_group(proc):
+    members = owned_group_members(proc)
+    if members is None:
+        return False
+    if members:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
         proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+    members = owned_group_members(proc)
+    if members is None:
+        return False
+    if members:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    try:
+        proc.wait(timeout=1)
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-    except ProcessLookupError:
-        pass
+        return False
+    until = time.monotonic() + 1
+    while True:
+        members = owned_group_members(proc)
+        if members is None:
+            return False
+        if not members:
+            return True
+        if time.monotonic() >= until:
+            return False
+        time.sleep(0.01)
 
 
 def invoke(root, state, phase, seconds, args, stopped):
@@ -249,6 +334,7 @@ def invoke(root, state, phase, seconds, args, stopped):
         with (folder / "stdout.jsonl").open("w") as out, (folder / "stderr.log").open("w") as err:
             proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=out, stderr=err,
                                     cwd=root, start_new_session=True, text=True)
+            register_owned_group(proc)
             identity = process_identity(proc.pid)
             record.update(pid=proc.pid, process_start=identity[0] if identity else None)
             state["active"] = record.copy()
@@ -256,7 +342,7 @@ def invoke(root, state, phase, seconds, args, stopped):
             proc.stdin.write(text)
             proc.stdin.close()
             until = time.monotonic() + seconds
-            while proc.poll() is None:
+            while not owned_group_finished(proc):
                 if stopped() or (root / "stop.request").exists():
                     record["outcome"] = "stopped"
                     break
@@ -267,7 +353,8 @@ def invoke(root, state, phase, seconds, args, stopped):
                     record["outcome"] = "access_denied"
                     break
                 time.sleep(min(0.1, max(0.001, until - time.monotonic())))
-            kill_group(proc)
+            if not kill_group(proc):
+                record["outcome"] = "cleanup_unverified"
             record["exit_code"] = proc.returncode
             if record["outcome"] == "running":
                 record["outcome"] = "ok" if proc.returncode == 0 else "error"
@@ -276,7 +363,8 @@ def invoke(root, state, phase, seconds, args, stopped):
         record["error"] = str(exc)
     finally:
         if proc:
-            kill_group(proc)
+            if not kill_group(proc):
+                record["outcome"] = "cleanup_unverified"
     result = None
     if record["outcome"] == "ok":
         try:
@@ -314,7 +402,7 @@ def partial_report(root, state):
                "notes/, evidence/, reviews/, and calls/ before resuming.\n")
 
 
-def sync_checkpoint(root, state, now=time.time):
+def sync_checkpoint(root, state, now=time.time, stopped=None):
     """Push this task's files, or stop before spending more model quota."""
     if not state.get("git_sync"):
         return True
@@ -328,7 +416,12 @@ def sync_checkpoint(root, state, now=time.time):
         return False
     if state.pop("sync_error", None) is not None:
         save(root, state)
-    result = sync_task(root, timeout=min(60, remaining))
+    result = sync_task(root, timeout=min(60, remaining), cancelled=stopped)
+    if result.get("cancelled"):
+        state.update(status="stopped", reason="Stopped during GitHub synchronization; local artifacts retained.",
+                     sync_error="GitHub synchronization cancelled; use sync to upload the checkpoint later.")
+        save(root, state)
+        return False
     if not result["pushed"]:
         state.update(status="blocked", reason="GitHub checkpoint failed; local artifacts retained.",
                      sync_error=result["error"])
@@ -383,7 +476,11 @@ def run_task(args):
         save(root, state)
         try:
             while True:
-                if not sync_checkpoint(root, state, now):
+                stopped = lambda: signal_stop[0] or (root / "stop.request").exists()
+                if stopped():
+                    state.update(status="stopped", reason="Stop requested; local checkpoint saved.")
+                    break
+                if not sync_checkpoint(root, state, now, stopped):
                     sync_failed = True
                     break
                 current = now()
@@ -483,7 +580,8 @@ def run_task(args):
             save(root, state)
             partial_report(root, state)
             if not sync_failed:
-                sync_checkpoint(root, state, now)
+                sync_checkpoint(root, state, now,
+                                lambda: signal_stop[0] or (root / "stop.request").exists())
         return state
 
 

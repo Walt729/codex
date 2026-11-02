@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import tempfile
@@ -142,6 +143,33 @@ class GitCheckpointTests(unittest.TestCase):
         self.assertFalse(result["pushed"])
         self.assertIn("time budget", result["error"])
         self.assertEqual(self.git("rev-parse", "HEAD"), before)
+
+    def test_cancellation_before_sync_leaves_index_and_history_unchanged(self):
+        before = self.git("rev-parse", "HEAD")
+        result = self.sync(cancelled=lambda: True)
+        self.assertTrue(result["cancelled"], result)
+        self.assertFalse(result["pushed"])
+        self.assertEqual(self.git("rev-parse", "HEAD"), before)
+        self.assertEqual(self.git("diff", "--cached", "--name-only"), b"")
+
+    def test_stop_request_cancels_hanging_push_without_waiting_for_timeout(self):
+        marker = self.home / "hook-started"
+        hook = self.repo / ".git" / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\nprintf started > " + shlex.quote(str(marker)) + "\nsleep 30\n")
+        hook.chmod(0o755)
+        stop_at = [None]
+        def cancelled():
+            if marker.exists() and stop_at[0] is None:
+                stop_at[0] = time.monotonic() + 0.1
+            return stop_at[0] is not None and time.monotonic() >= stop_at[0]
+        before = time.monotonic()
+        result = self.sync(timeout=5, cancelled=cancelled)
+        elapsed = time.monotonic() - before
+        self.assertTrue(marker.exists(), "Did not reach the real pre-push hook")
+        self.assertTrue(result["cancelled"], result)
+        self.assertFalse(result["pushed"])
+        self.assertLess(elapsed, 2)
+        self.assertEqual(self.git("rev-parse", "HEAD").decode().strip(), result["commit"])
 
     def test_deleted_task_file_is_committed_and_pushed(self):
         self.assertTrue(self.sync()["pushed"])

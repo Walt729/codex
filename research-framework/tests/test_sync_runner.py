@@ -46,6 +46,19 @@ class SyncRunnerTests(unittest.TestCase):
         self.assertEqual(state["sync_error"], "Push rejected")
         self.assertTrue((self.root / "checkpoint.md").exists())
 
+    def test_stop_during_sync_does_not_call_model_or_retry_sync_on_exit(self):
+        def cancelled_backup(root, **kwargs):
+            (root / "stop.request").write_text("requested")
+            self.assertTrue(kwargs["cancelled"]())
+            return {"pushed": False, "cancelled": True, "error": "Stopped", "commit": None}
+        with patch("git_checkpoint.sync_task", side_effect=cancelled_backup) as backup, \
+             patch.object(runner, "invoke") as model:
+            state = runner.run_task(self.args)
+        self.assertEqual(state["status"], "stopped")
+        self.assertTrue((self.root / "checkpoint.md").exists())
+        backup.assert_called_once()
+        model.assert_not_called()
+
     def test_final_report_is_present_before_final_push(self):
         snapshots = []
         def backup(root, **kwargs):
