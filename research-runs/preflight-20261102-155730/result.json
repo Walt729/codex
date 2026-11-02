@@ -99,7 +99,10 @@
     ]
   },
   "github_sync": {
-    "status": "pending_current_check"
+    "status": "passed",
+    "verified_commit": "f61ee9878c1195c761affa280a6299278b512036",
+    "verification": "Independent git ls-remote matched the commit returned by runner sync.",
+    "verified_at": "2026-11-02T15:59:24.456959+08:00"
   },
   "limitations": [
     "No actual model-backed stop or multi-stage review was verified.",
