@@ -1,0 +1,115 @@
+{
+  "recorded_at": "2026-11-02T15:57:30.964439+08:00",
+  "mode": "preflight_only",
+  "six_hour_research_started": false,
+  "five_minute_real_model_run": {
+    "started": false,
+    "reason": "Real model authentication failed before trial."
+  },
+  "model_check": {
+    "status": "failed_authentication",
+    "maximum_seconds": 45,
+    "result": {
+      "exit_code": 1,
+      "last_message": null,
+      "errors": [
+        "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.",
+        {
+          "message": "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
+        }
+      ]
+    }
+  },
+  "stop_check": {
+    "mode": "offline_fake_CLI_and_local_Git_only",
+    "tests_run": 6,
+    "passed": 6,
+    "failures": 0,
+    "errors": 0,
+    "seconds": 2.0345,
+    "timings": [
+      {
+        "test": "test_runner.RunnerTests.test_stop_terminates_child_and_resume_keeps_budget",
+        "seconds": 0.4231
+      },
+      {
+        "test": "test_runner.RunnerTests.test_duplicate_supervisor_is_rejected",
+        "seconds": 0.338
+      },
+      {
+        "test": "test_runner.RunnerTests.test_crashed_supervisor_retires_orphan_before_resume",
+        "seconds": 0.3575
+      },
+      {
+        "test": "test_runner.RunnerTests.test_unsafe_orphan_identity_is_blocked_without_launch",
+        "seconds": 0.1215
+      },
+      {
+        "test": "test_git_checkpoint.GitCheckpointTests.test_hanging_push_is_bounded_by_total_sync_budget",
+        "seconds": 0.7519
+      },
+      {
+        "test": "test_git_checkpoint.GitCheckpointTests.test_total_timeout_prevents_any_work",
+        "seconds": 0.0421
+      }
+    ],
+    "after_cleanup_fix": {
+      "tests_run": 9,
+      "passed": 9,
+      "seconds": 1.7684,
+      "errors": 0,
+      "failures": 0
+    },
+    "measured_stop": {
+      "mode": "offline_fake_CLI",
+      "seconds": 0.1108,
+      "runner_return_code": 0,
+      "status": "stopped",
+      "call_outcome": "stopped",
+      "child_state": "gone",
+      "child_running": false
+    },
+    "reproduction_before_fix": {
+      "kind": "offline_process_cleanup_reproduction",
+      "leader_pid": 9736,
+      "leader_exit_code": 0,
+      "child_pid": 9737,
+      "child_live_before": true,
+      "child_live_after_existing_kill_group": true
+    },
+    "latest_cleanup_tests": {
+      "tests_run": 6,
+      "passed": 6,
+      "seconds": 0.595,
+      "failures": 0,
+      "errors": 0,
+      "file": "research-framework/tests/test_process_cleanup.py"
+    },
+    "changes": [
+      "Capture own child session and birth identities immediately after launch.",
+      "Use waitid(WNOWAIT) to capture descendants before reaping a completed leader.",
+      "Terminate a group only while original leader or recorded member identities still anchor it.",
+      "After TERM, kill remaining owned descendants; bound reaping and verify no active group members.",
+      "Mark cleanup_unverified rather than claim success when identity or cleanup cannot be established."
+    ],
+    "limitations": [
+      "These tests use fake CLI processes and local Git only; no actual model call was made.",
+      "They verify descendants remaining in the owned process group; descendants that create a separate session are outside this mechanism.",
+      "No six-hour task was started and no GitHub push was performed by this agent."
+    ]
+  },
+  "github_sync": {
+    "status": "pending_current_check"
+  },
+  "limitations": [
+    "No actual model-backed stop or multi-stage review was verified.",
+    "A short preflight does not establish six-hour cloud instance survival."
+  ],
+  "regression_tests": {
+    "run": 44,
+    "passed": 44,
+    "failed": 0,
+    "seconds": 10.423,
+    "kind": "offline_fake_CLI_and_local_Git"
+  }
+}
